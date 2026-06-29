@@ -1,128 +1,129 @@
 """
 ekf_estimator.py
 ----------------
-Extended Kalman Filter (EKF) for fusing wheel-encoder odometry with
-IMU yaw rate to estimate the robot's 2-D pose: [x, y, theta].
+Extended Kalman Filter pose estimator using filterpy.
 
-State vector:
-    x = [x_cm, y_cm, theta_rad]
+State vector: [x_cm, y_cm, theta_rad]
+Inputs      : wheel encoder speeds (v_l, v_r), steering angle, IMU heading
 
-Inputs (control vector):
-    u = [v_cms, steer_deg]
-        v_cms     — forward speed derived from encoders (cm/s)
-        steer_deg — steering angle from servo encoder / commanded angle
+Based on ekf4class.py — the most complete EKF version in the original repo.
+Uses sensor-only measurements (no commanded values) for robustness.
 
-Measurement:
-    z = [d_yaw]  — change in heading from IMU (rad/s × dt)
+Requires:  pip install filterpy
 
 Usage:
-    ekf = EKFEstimator()
-    pose = ekf.update(pose, dt, speed, steer, enc_r, enc_l, steer_enc, imu_z)
+    ekf = EKFEstimator(wheelbase_cm=13.0)
+    pose = ekf.update(v_l, v_r, delta_rad, imu_theta_rad)
+    # pose = [x_cm, y_cm, theta_rad]
 """
 
 import numpy as np
-from config import RobotParams
+import time
+
+try:
+    from filterpy.kalman import ExtendedKalmanFilter
+    _FILTERPY = True
+except ImportError:
+    _FILTERPY = False
+    print("[EKF] filterpy not installed — using simple odometry fallback")
 
 
 class EKFEstimator:
     """
-    Differential-drive EKF with Ackermann steering kinematics.
+    Sensor-fused pose estimator.
 
-    Call update() once per control loop iteration.
+    If filterpy is available: full EKF with covariance propagation.
+    Otherwise: simple Ackermann dead-reckoning (fallback).
     """
 
-    def __init__(self):
-        # Process noise covariance Q — tune these!
-        self.Q = np.diag([1.0, 1.0, np.radians(2.0)]) ** 2
+    def __init__(self, wheelbase_cm: float = 13.0):
+        self.wheelbase  = wheelbase_cm / 100.0   # convert to metres internally
+        self.prev_time  = time.time()
+        self._pose      = np.array([0.0, 0.0, 0.0])   # fallback state
 
-        # Measurement noise covariance R (yaw from IMU)
-        self.R = np.diag([np.radians(1.0)]) ** 2
-
-        # Estimate covariance (starts uncertain)
-        self.P = np.eye(3) * 100.0
+        if _FILTERPY:
+            self.ekf        = ExtendedKalmanFilter(dim_x=3, dim_z=3)
+            self.ekf.x      = np.array([0., 0., 0.])
+            self.ekf.P     *= 0.0
+            self.ekf.Q      = np.eye(3) * 0.01
+            self.ekf.R      = np.diag([0.01, 0.01, 0.002])
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update(
-        self,
-        pose: list,
-        dt: float,
-        speed_cms: float,
-        steer_deg: float,
-        enc_right: int,
-        enc_left: int,
-        steer_enc: float,
-        imu_yaw_rate: float,
-    ) -> list:
+    def update(self, v_l: float, v_r: float,
+               delta_meas: float, imu_theta_rad: float) -> np.ndarray:
         """
-        Run one EKF predict + update cycle.
+        Run one EKF predict + update step.
 
         Args:
-            pose         : Current [x, y, theta] (will be updated in-place).
-            dt           : Time step in seconds.
-            speed_cms    : Forward speed from encoders (cm/s).
-            steer_deg    : Commanded steering angle (degrees).
-            enc_right    : Right encoder pulse count (unused directly —
-                           speed_cms already derived from encoders).
-            enc_left     : Left encoder pulse count.
-            steer_enc    : Potentiometer-measured actual steering angle (deg).
-            imu_yaw_rate : IMU yaw rate (rad/s).
+            v_l           : Left  wheel speed (cm/s).
+            v_r           : Right wheel speed (cm/s).
+            delta_meas    : Measured steering angle (radians).
+            imu_theta_rad : Absolute heading from IMU integration (radians).
 
         Returns:
-            Updated [x, y, theta] pose list.
+            np.ndarray [x_cm, y_cm, theta_rad] updated pose.
         """
-        x = np.array(pose, dtype=float)
+        now = time.time()
+        dt  = max(now - self.prev_time, 1e-4)
+        self.prev_time = now
+
+        # Convert cm/s → m/s for internal calculation
+        v = (v_l + v_r) / 2.0 / 100.0
+
+        if not _FILTERPY:
+            return self._dead_reckoning(v, delta_meas, dt)
 
         # ── Predict ───────────────────────────────────────────────────────────
-        x_pred, F = self._motion_model(x, speed_cms, steer_deg, dt)
-        P_pred = F @ self.P @ F.T + self.Q
+        self.ekf.F = self._jacobian(self.ekf.x, dt, v, delta_meas)
+        self.ekf.x = self._fx(self.ekf.x, dt, v, delta_meas)
+        self.ekf.predict()
 
-        # ── Update (IMU yaw measurement) ──────────────────────────────────────
-        dtheta_imu = imu_yaw_rate * dt                # measured heading change
-        z          = np.array([dtheta_imu])
+        # ── Update (replace yaw with IMU reading) ─────────────────────────────
+        z          = self.ekf.x.copy()
+        z[2]       = imu_theta_rad
+        self.ekf.update(z=z,
+                        HJacobian=lambda x: np.eye(3),
+                        Hx=lambda x: x)
 
-        H          = np.array([[0.0, 0.0, 1.0]])      # we observe theta
-        z_pred     = np.array([x_pred[2] - x[2]])     # predicted dtheta
-        y_innov    = z - z_pred
+        # Convert x back to cm
+        result    = self.ekf.x.copy()
+        result[0] *= 100.0
+        result[1] *= 100.0
+        return result
 
-        S = H @ P_pred @ H.T + self.R
-        K = P_pred @ H.T @ np.linalg.inv(S)           # Kalman gain
+    def reset(self) -> None:
+        """Reset pose to origin."""
+        self._pose = np.array([0.0, 0.0, 0.0])
+        if _FILTERPY:
+            self.ekf.x = np.array([0., 0., 0.])
+            self.ekf.P = np.zeros((3, 3))
 
-        x_upd      = x_pred + (K @ y_innov).flatten()
-        self.P     = (np.eye(3) - K @ H) @ P_pred
+    # ── Internal ──────────────────────────────────────────────────────────────
 
-        # Normalise heading to [-π, π]
-        x_upd[2]   = np.arctan2(np.sin(x_upd[2]), np.cos(x_upd[2]))
+    def _fx(self, x: np.ndarray, dt: float,
+             v: float, delta: float) -> np.ndarray:
+        """Ackermann kinematic motion model (state in metres)."""
+        dx     = v * np.cos(x[2]) * dt
+        dy     = v * np.sin(x[2]) * dt
+        dtheta = (v / self.wheelbase) * np.tan(delta) * dt
+        return x + np.array([dx, dy, dtheta])
 
-        pose[0], pose[1], pose[2] = float(x_upd[0]), float(x_upd[1]), float(x_upd[2])
-        return pose
-
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    @staticmethod
-    def _motion_model(x: np.ndarray, v: float, steer_deg: float,
-                      dt: float) -> tuple:
-        """
-        Ackermann kinematic motion model.
-
-        Returns:
-            (x_new, F) where F is the Jacobian of the motion model.
-        """
-        L       = RobotParams.WHEELBASE_CM
-        theta   = x[2]
-        delta   = np.radians(steer_deg)
-
-        dx      = v * np.cos(theta) * dt
-        dy      = v * np.sin(theta) * dt
-        dtheta  = (v / L) * np.tan(delta) * dt
-
-        x_new   = x + np.array([dx, dy, dtheta])
-
-        # Jacobian F = d(x_new) / d(x)
-        F = np.array([
-            [1, 0, -v * np.sin(theta) * dt],
-            [0, 1,  v * np.cos(theta) * dt],
-            [0, 0,  1                      ],
+    def _jacobian(self, x: np.ndarray, dt: float,
+                   v: float, delta: float) -> np.ndarray:
+        return np.array([
+            [1, 0, -v * np.sin(x[2]) * dt],
+            [0, 1,  v * np.cos(x[2]) * dt],
+            [0, 0,  1],
         ])
 
-        return x_new, F
+    def _dead_reckoning(self, v: float, delta: float,
+                         dt: float) -> np.ndarray:
+        """Simple fallback when filterpy is not available."""
+        x, y, theta = self._pose
+        self._pose = np.array([
+            x     + v * np.cos(theta) * dt * 100,   # back to cm
+            y     + v * np.sin(theta) * dt * 100,
+            theta + (v / self.wheelbase) * np.tan(delta) * dt,
+        ])
+        return self._pose.copy()
