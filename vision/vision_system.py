@@ -1,186 +1,277 @@
 """
 vision_system.py
 ----------------
-Camera capture and computer-vision detection pipeline.
+Camera capture and computer-vision detection pipeline for the WRO car.
 
-Detects:
-    - Red and green traffic pillars (coloured cylinders on the track)
-    - Magenta parking markers (Challenge round only)
+Uses PiCamera2 for capture and OpenCV HSV segmentation to detect:
+    - Red  traffic pillars  → TrafficSign(color="red")
+    - Green traffic pillars → TrafficSign(color="green")
+    - Magenta parking marker → ParkingLotMarker  (Lap 1 Side 1 only)
 
-Each detected object is returned as a TrafficSign instance with:
-    .color        — "red" | "green" | "magenta"
-    .x_cm         — lateral distance from robot centre (cm, right = positive)
-    .y_cm         — forward distance from robot (cm)
-    .x_px, .y_px  — pixel centroid in the frame
-    .bbox         — (x, y, w, h) bounding box in pixels
-    .bbox_width_px— bounding box width (used for distance estimation)
+Object memory:
+    Lap 1 : detects and registers up to 2 objects per side for 15 frames,
+             then freezes the side registry.
+    Lap 2+ : replays Lap 1 memory and updates geometry from live detections.
 
 Usage:
-    vision = Vision()
-    vision.capture_and_detect()
-    for obj in vision.detections:
-        print(obj.color, obj.x_cm, obj.y_cm)
-    vision.release()
+    vision = Vision(debug=False)
+    vision.init_camera_and_detect()          # call each loop iteration
+    objects = vision.current_side_registry   # list of TrafficSign
+    vision.next_side()                       # call when crossing a corner line
 """
 
 import cv2
 import numpy as np
-from config import VisionParams
+import time
+from picamera2 import Picamera2
 
+from vision.traffic_sign import TrafficSign
+from vision.parking      import ParkingLotMarker
+from vision.config       import HSV_RANGES, REAL_WIDTH_CM, FOCAL_LENGTH_PX
 
-# ── Data class ────────────────────────────────────────────────────────────────
-
-class TrafficSign:
-    """Represents one detected object in the scene."""
-
-    def __init__(self, color: str, x_px: float, y_px: float,
-                 bbox: tuple, bbox_width_px: float):
-        self.color         = color
-        self.x_px          = x_px
-        self.y_px          = y_px
-        self.bbox          = bbox          # (x, y, w, h)
-        self.bbox_width_px = bbox_width_px
-        self.x_cm: float | None = None    # filled by depth estimation
-        self.y_cm: float | None = None
-        self.section_nb: int    = 0        # filled by main loop
-
-
-# ── Vision pipeline ───────────────────────────────────────────────────────────
 
 class Vision:
-    """Wraps camera capture and HSV colour segmentation."""
+    """Full vision pipeline: capture → detect → track → registry."""
 
-    # HSV ranges (H: 0-179, S: 0-255, V: 0-255 in OpenCV)
-    _RANGES = {
-        "red":     [(np.array([0,  120, 70]),  np.array([10,  255, 255])),
-                    (np.array([170, 120, 70]),  np.array([180, 255, 255]))],
-        "green":   [(np.array([40,  70,  70]),  np.array([80,  255, 255]))],
-        "magenta": [(np.array([140, 100, 100]), np.array([170, 255, 255]))],
-    }
+    def __init__(self, debug: bool = False):
+        self.debug        = debug
+        self.lap_number   = 1
+        self.side_number  = 1
+        self.max_laps     = 3
+        self.max_sides    = 4
 
-    MIN_CONTOUR_AREA = 500   # px² — ignore tiny blobs
+        # Per-lap/side object registries
+        self.lap_memory           = []   # list of lists (one per side, Lap 1)
+        self.current_side_registry = []
+        self.current_lap_registry  = []
 
-    def __init__(self):
-        self.cap              = None
-        self.detections: list = []        # TrafficSign objects from latest frame
-        self.parking_marker   = None      # TrafficSign | None
-        self.lap_number: int  = 1
-        self.side_number: int = 1
-        self.current_side_registry: list = []
+        # State flags
+        self.registry_done       = False
+        self.freeze_processing   = False
+        self.side_initialized    = False
+        self.detection_frames    = 0
+        self.detection_frame_limit = 15
 
-        # Camera intrinsics for distance estimation
-        self._focal_px    = VisionParams.FOCAL_LENGTH_PX
-        self._pillar_w_cm = VisionParams.PILLAR_WIDTH_CM
-        self._frame_cx    = VisionParams.CAMERA_WIDTH / 2.0
-
-        self._open_camera()
+        self.sight          = []
+        self.parking_marker = None   # single magenta marker from Lap 1
+        self.picam2         = None   # lazy-initialised camera
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def capture_and_detect(self) -> list:
+    def init_camera_and_detect(self) -> None:
         """
-        Grab one frame, run detection, update self.detections.
+        Initialise PiCamera2 on first call, capture one frame, run detection.
+        Call this once per main-loop iteration.
+        """
+        if self.picam2 is None:
+            self.picam2 = Picamera2()
+            self.picam2.preview_configuration.main.size   = (3300, 2500)
+            self.picam2.preview_configuration.main.format = "RGB888"
+            self.picam2.configure("preview")
+            self.picam2.start()
+            time.sleep(1)   # warm-up
 
-        Returns:
-            List of TrafficSign objects detected in this frame.
+        frame = self.picam2.capture_array()
+        frame = cv2.flip(frame, 1)
+        self.detect_obstacles(frame)
+
+    def detect_obstacles(self, frame: np.ndarray) -> list:
         """
-        frame = self._grab_frame()
-        if frame is None:
+        Run one detection pass on the given BGR frame.
+
+        Updates self.current_side_registry and self.parking_marker.
+        Returns the current side registry list.
+        """
+        allow_magenta_only = self.lap_number in [2, 3] and self.side_number == 1
+
+        if self.registry_done and not allow_magenta_only:
+            if self.debug:
+                self._overlay_status(frame, frozen=True)
             return []
 
-        self.detections      = []
-        self.parking_marker  = None
+        frame_h, frame_w = frame.shape[:2]
+        hsv = cv2.cvtColor(cv2.GaussianBlur(frame, (5, 5), 0), cv2.COLOR_BGR2HSV)
 
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        blurred = cv2.GaussianBlur(hsv, (5, 5), 0)
+        all_detections = self._detect_colored(hsv, frame_w, frame_h)
 
-        for color, ranges in self._RANGES.items():
-            mask = self._build_mask(blurred, ranges)
-            signs = self._detect_objects(mask, color, frame)
-            if color == "magenta" and signs:
-                self.parking_marker = signs[0]
-            else:
-                self.detections.extend(signs)
+        # ── Lap 1: build registry ─────────────────────────────────────────────
+        if not self.side_initialized and self.lap_number == 1:
+            self._register_new_objects(all_detections, frame_w, frame_h)
+            self.detection_frames += 1
+            if self.detection_frames >= self.detection_frame_limit:
+                self.side_initialized = True
 
-        self.current_side_registry = self.detections[:]
-        return self.detections
+        # ── All laps: update existing object geometry ─────────────────────────
+        else:
+            self._update_existing_objects(all_detections, frame_w, frame_h)
 
-    # Legacy name used by Super_main.py
-    def init_camera_and_detect(self):
-        self.capture_and_detect()
+        # ── Magenta parking marker (Side 1 only) ──────────────────────────────
+        self._detect_magenta(hsv, frame_w, frame_h, frame)
 
-    def release(self):
-        """Release the camera resource."""
-        if self.cap and self.cap.isOpened():
-            self.cap.release()
+        # ── Lap 2+ memory update ──────────────────────────────────────────────
+        if self.lap_number >= 2 and self.side_number <= len(self.lap_memory):
+            self.update_memory_objects(all_detections, frame_w, frame_h)
+
+        if self.debug:
+            self._draw_debug(frame, frame_w, frame_h)
+
+        return self.current_side_registry
+
+    def next_side(self) -> None:
+        """
+        Advance to the next side/lap. Call when the colour sensor detects a
+        corner line (orange or blue).
+        """
+        if self.registry_done:
+            return
+
+        print(f"[VISION] Finished side {self.side_number} of lap {self.lap_number}")
+        self.current_lap_registry.append(self.current_side_registry[:])
+        self.side_number += 1
+        self._reset_side_registry()
+
+        if self.side_number > self.max_sides:
+            print(f"[VISION] Completed lap {self.lap_number}")
+            if self.lap_number == 1:
+                self.lap_memory       = self.current_lap_registry[:]
+                self.freeze_processing = True
+            self.lap_number         += 1
+            self.side_number         = 1
+            self.current_lap_registry = []
+
+            if self.lap_number > self.max_laps:
+                print("[VISION] All 3 laps done — vision processing stopped.")
+                self.registry_done = True
+
+    def update_memory_objects(self, new_detections: list,
+                               frame_w: int, frame_h: int) -> None:
+        """Update Lap-1 memory objects with fresh geometry from current detections."""
+        if self.lap_number < 2 or self.side_number > len(self.lap_memory):
+            return
+        for obj in self.lap_memory[self.side_number - 1]:
+            obj.alive = False
+            for det in new_detections:
+                if det["color"] != obj.color:
+                    continue
+                if abs(det["x_px"] - obj.x_px) < 50 and abs(det["y_px"] - obj.y_px) < 50:
+                    obj.update_position(det["x_px"], det["y_px"],
+                                        det["bbox"], det["bbox_width_px"])
+                    obj.calculate_geometry(frame_w, frame_h,
+                                           REAL_WIDTH_CM[det["color"]], FOCAL_LENGTH_PX)
+                    obj.alive = True
+                    break
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _open_camera(self):
-        """Open the first available camera."""
-        self.cap = cv2.VideoCapture(0)
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  VisionParams.CAMERA_WIDTH)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, VisionParams.CAMERA_HEIGHT)
-        self.cap.set(cv2.CAP_PROP_FPS,          VisionParams.CAMERA_FPS)
+    def _reset_side_registry(self):
+        self.current_side_registry = []
+        self.side_initialized      = False
+        self.detection_frames      = 0
 
-    def _grab_frame(self):
-        """Grab and return one BGR frame, or None on failure."""
-        if not self.cap or not self.cap.isOpened():
-            self._open_camera()
-        ret, frame = self.cap.read()
-        return frame if ret else None
+    def _detect_colored(self, hsv: np.ndarray,
+                         frame_w: int, frame_h: int) -> list:
+        """Detect red and green objects; return list of detection dicts."""
+        detections = []
+        kernel = np.ones((5, 5), np.uint8)
+        for color in ("red", "red2", "green"):
+            lo, hi = HSV_RANGES[color]
+            mask = cv2.inRange(hsv, np.array(lo), np.array(hi))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)[0]:
+                if cv2.contourArea(cnt) < 1000:
+                    continue
+                x, y, w, h = cv2.boundingRect(cnt)
+                cx, cy     = x + w // 2, y + h // 2
+                label      = "red" if "red" in color else "green"
+                detections.append({
+                    "color":        label,
+                    "x_px":         cx,
+                    "y_px":         cy,
+                    "bbox":         (x, y, w, h),
+                    "bbox_width_px": w,
+                    "distance_cm":  (REAL_WIDTH_CM[label] * FOCAL_LENGTH_PX) / w,
+                })
+        return detections
 
-    @staticmethod
-    def _build_mask(hsv: np.ndarray, ranges: list) -> np.ndarray:
-        """Combine one or more HSV ranges into a single binary mask."""
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for lo, hi in ranges:
-            mask |= cv2.inRange(hsv, lo, hi)
-        # Morphological clean-up
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    def _register_new_objects(self, detections: list,
+                               frame_w: int, frame_h: int) -> None:
+        """Add newly seen objects to the side registry (up to 2)."""
+        for det in detections:
+            if len(self.current_side_registry) >= 2:
+                break
+            matched = any(
+                abs(det["x_px"] - o.x_px) < 50 and
+                abs(det["y_px"] - o.y_px) < 50 and
+                det["color"] == o.color
+                for o in self.current_side_registry
+            )
+            if not matched:
+                obj = TrafficSign(det["color"], det["x_px"], det["y_px"],
+                                  det["bbox"], det["bbox_width_px"])
+                obj.calculate_geometry(frame_w, frame_h,
+                                       REAL_WIDTH_CM[det["color"]], FOCAL_LENGTH_PX)
+                self.current_side_registry.append(obj)
+
+    def _update_existing_objects(self, detections: list,
+                                  frame_w: int, frame_h: int) -> None:
+        """Update geometry of already-registered objects."""
+        for obj in self.current_side_registry:
+            obj.alive = False
+            for det in detections:
+                if (det["color"] == obj.color and
+                        abs(det["x_px"] - obj.x_px) < 50 and
+                        abs(det["y_px"] - obj.y_px) < 50):
+                    obj.update_position(det["x_px"], det["y_px"],
+                                        det["bbox"], det["bbox_width_px"])
+                    obj.calculate_geometry(frame_w, frame_h,
+                                           REAL_WIDTH_CM[det["color"]], FOCAL_LENGTH_PX)
+                    obj.alive = True
+                    break
+
+    def _detect_magenta(self, hsv: np.ndarray,
+                         frame_w: int, frame_h: int, frame: np.ndarray) -> None:
+        """Detect and track the magenta parking marker (Side 1 only)."""
+        if self.side_number != 1:
+            return
+        lo, hi = HSV_RANGES["magenta"]
+        mask   = cv2.inRange(hsv, np.array(lo), np.array(hi))
+        kernel = np.ones((5, 5), np.uint8)
         mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
         mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        return mask
-
-    def _detect_objects(self, mask: np.ndarray, color: str,
-                        frame: np.ndarray) -> list:
-        """Find contours and convert each to a TrafficSign with cm coords."""
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
-        results = []
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if area < self.MIN_CONTOUR_AREA:
+        for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            if cv2.contourArea(cnt) < 1000:
                 continue
-
             x, y, w, h = cv2.boundingRect(cnt)
-            cx = x + w / 2.0
-            cy = y + h / 2.0
+            cx, cy = x + w // 2, y + h // 2
+            if self.parking_marker is None and self.lap_number == 1:
+                self.parking_marker = ParkingLotMarker(cx, cy, (x, y, w, h),
+                                                       w, self.lap_number)
+            elif self.parking_marker:
+                self.parking_marker.update_position(cx, cy, (x, y, w, h), w)
+            if self.parking_marker:
+                self.parking_marker.calculate_geometry(
+                    frame_w, frame_h, REAL_WIDTH_CM["magenta"], FOCAL_LENGTH_PX)
+            break  # only one magenta marker per frame
 
-            sign = TrafficSign(color, cx, cy, (x, y, w, h), w)
-            sign.x_cm, sign.y_cm = self._estimate_position(cx, w)
-            results.append(sign)
+    def _draw_debug(self, frame: np.ndarray,
+                    frame_w: int, frame_h: int) -> None:
+        """Draw bounding boxes and labels on frame when debug=True."""
+        for obj in self.current_side_registry:
+            x, y, w, h = obj.bbox
+            bgr = (0, 0, 255) if obj.color == "red" else (0, 255, 0)
+            cv2.rectangle(frame, (x, y), (x + w, y + h), bgr, 2)
+            cv2.putText(frame, f"{obj.color.upper()} {obj.distance_cm:.1f}cm",
+                        (x, y - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
+            cv2.putText(frame, f"Angle: {obj.angle_horizontal:+.1f}",
+                        (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, bgr, 2)
+        self._overlay_status(frame)
 
-        # Sort nearest-first
-        results.sort(key=lambda s: s.y_cm if s.y_cm else float("inf"))
-        return results
-
-    def _estimate_position(self, cx_px: float, width_px: float) -> tuple:
-        """
-        Estimate object position relative to robot using the pinhole model.
-
-        Args:
-            cx_px    : horizontal pixel centroid of the bounding box
-            width_px : pixel width of the bounding box
-
-        Returns:
-            (x_cm, y_cm) — lateral and forward distance in centimetres.
-            x_cm: negative = left of robot, positive = right.
-            y_cm: forward distance (always positive).
-        """
-        if width_px < 1:
-            return None, None
-
-        y_cm = (self._focal_px * self._pillar_w_cm) / width_px
-        x_cm = (cx_px - self._frame_cx) * y_cm / self._focal_px
-        return round(x_cm, 1), round(y_cm, 1)
+    def _overlay_status(self, frame: np.ndarray, frozen: bool = False) -> None:
+        tag = " (Frozen)" if frozen else ""
+        cv2.putText(frame,
+                    f"Lap: {self.lap_number}/3 | Side: {self.side_number}/4{tag}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
+                    (0, 0, 255) if frozen else (255, 255, 0), 2)
