@@ -1,184 +1,191 @@
 """
 trajectory_builder.py
 ---------------------
-Builds smooth Bézier-curve trajectories around detected traffic pillars.
+Bézier-curve trajectory planner for navigating around WRO traffic pillars.
 
-The trajectory is represented as three parallel arrays (all length N_POINTS):
-    points          : np.ndarray (N, 2)  — (x, y) waypoints in cm
-    steering_angles : np.ndarray (N,)    — target steering angle at each point (degrees)
-    speeds          : np.ndarray (N,)    — target motor speed at each point (0-100)
+Ported from the original TrajectoryBuilder.py with:
+  - Fixed imports (no hardcoded Windows paths)
+  - Renamed class to TrajectoryBuilder (snake_case consistent)
+  - Docstrings added throughout
+  - Test/demo block preserved under __main__
+
+The planner builds a smooth path through a sequence of via-points offset
+from each detected pillar, respecting WRO passing rules:
+    Red   pillar → pass to the RIGHT
+    Green pillar → pass to the LEFT
 
 Usage:
-    builder = TrajectoryBuilder()
-    points, steering, speeds = builder.build(pillars, start_dir, end_dir)
+    builder = TrajectoryBuilder(resolution_cm=5.0)
+    points, steering, speed, seg_lengths = builder.bezier_curve_from_pillars(
+        pillars, g0, d0, df, theta
+    )
 """
 
 import numpy as np
-from config import TrajParams, RobotParams
+from scipy.ndimage import gaussian_filter1d
 
 
 class TrajectoryBuilder:
-    """
-    Generates Bézier-curve paths that navigate around coloured pillars.
+    """Builds Bézier-curve trajectories around detected pillars."""
 
-    Rules (WRO Future Engineers):
-        - Pass to the RIGHT of red pillars.
-        - Pass to the LEFT of green pillars.
-    """
+    last_calculated_trajectory = None   # class-level cache
 
-    PILLAR_OFFSET_CM = 20.0   # How far to the side to aim past a pillar (cm)
-    N = TrajParams.N_POINTS
+    def __init__(self, resolution_cm: float = 5.0):
+        """
+        Args:
+            resolution_cm : Arc-length spacing between waypoints (cm).
+                            Smaller = smoother but more points.
+        """
+        self.resolution_cm = resolution_cm
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def build(
-        self,
-        pillars: list,
-        start_dir: np.ndarray,
-        end_dir: np.ndarray,
-    ) -> tuple:
+    def bezier_curve_from_pillars(self, pillars, g0: np.ndarray,
+                                   d0: np.ndarray, df: np.ndarray,
+                                   theta: float) -> tuple:
         """
-        Build a trajectory through/around the given pillars.
+        Build a trajectory through all given pillars.
 
         Args:
-            pillars   : List of TrafficSign objects with .x_cm, .y_cm, .color.
-                        Already sorted nearest-first.
-            start_dir : Unit vector (2,) — robot's current heading direction.
-            end_dir   : Unit vector (2,) — desired heading at the end of the curve.
+            pillars : Array-like of objects with .x_cm, .y_cm, .color, .section_nb
+            g0      : Start position [x, y] in cm
+            d0      : Start direction unit vector [dx, dy]
+            df      : End direction unit vector [dx, dy]
+            theta   : Robot heading angle in radians (used for offset direction)
 
         Returns:
-            (points, steering_angles, speeds) — three np.ndarray arrays of
-            length N_POINTS.
+            (points, steering_angles, safe_speeds, segment_lengths)
+            All arrays aligned by index.
         """
-        if not pillars:
-            return self._straight_trajectory(start_dir)
+        pillars = np.asarray(pillars)
+        n = pillars.shape[0]
 
-        # Build a sequence of via-points offset from each pillar
-        via_points = [np.array([0.0, 0.0])]  # robot is at origin
-        for p in pillars[:3]:                  # use at most 3 nearest pillars
-            via_points.append(self._offset_point(p))
-        via_points = np.array(via_points)
+        # Build via-points: start + one offset point per pillar
+        v = np.zeros((n + 1, 2))
+        v[0] = g0
+        for i in range(1, n + 1):
+            p = pillars[i - 1]
+            x, y, color, sec = p.x_cm, p.y_cm, p.color, p.section_nb
+            offset = 20   # cm to pass beside the pillar
+            if sec == 1:
+                v[i] = [x - offset * np.sin(theta), y - offset * np.cos(theta)]                     if color == "red" else                        [x + offset * np.sin(theta), y + offset * np.cos(theta)]
+            elif sec == 2:
+                v[i] = [x - offset * np.cos(theta), y + offset * np.sin(theta)]                     if color == "red" else                        [x + offset * np.cos(theta), y - offset * np.sin(theta)]
+            elif sec == 3:
+                v[i] = [x + offset * np.sin(theta), y + offset * np.cos(theta)]                     if color == "red" else                        [x - offset * np.sin(theta), y - offset * np.cos(theta)]
+            else:
+                v[i] = [x + offset * np.cos(theta), y - offset * np.sin(theta)]                     if color == "red" else                        [x - offset * np.cos(theta), y + offset * np.sin(theta)]
 
-        # Fit a cubic Bézier through the via-points
-        points = self._bezier_curve(via_points, start_dir, end_dir)
+        # Compute tangent directions at each via-point
+        dv = np.zeros_like(v)
+        dv[0]  = d0
+        dv[-1] = df
+        kc = 0.0085   # smoothing constant
+        for i in range(1, dv.shape[0] - 1):
+            tdv    = v[i + 1] - v[i]
+            dv[i]  = tdv + kc * np.linalg.norm(tdv) * (v[i] - v[i - 1])
 
-        # Derive steering angles from the curve's tangent vectors
-        steering = self._steering_from_tangents(points)
+        # Sample each segment
+        all_points, all_steering, all_speed, seg_lengths = [], [], [], []
+        for i in range(len(v) - 1):
+            pts, steer, spd = self._sample_segment(v[i], v[i+1], dv[i], dv[i+1])
+            all_points.append(pts)
+            all_steering.append(steer)
+            all_speed.append(spd)
+            seg_lengths.append(len(pts))
 
-        # Assign speeds — slower when steering sharply
-        speeds = self._speed_profile(steering)
+        points   = np.vstack(all_points)
+        steering = np.concatenate(all_steering)
+        speed    = np.concatenate(all_speed)
 
-        return points, steering, speeds
+        # Cache result
+        TrajectoryBuilder.last_calculated_trajectory = {
+            "x":             [round(float(xi), 2) for xi in points[:, 0]],
+            "y":             [round(float(yi), 2) for yi in points[:, 1]],
+            "steering_angle": [round(float(a),  2) for a in steering],
+            "safe_speed":    [round(float(s),  2) for s in speed],
+        }
 
-    def bezier_curve_from_pillars(
-        self,
-        pillars,
-        g0: np.ndarray,
-        d0: np.ndarray,
-        df: np.ndarray,
-    ) -> tuple:
-        """
-        Legacy interface used by Super_main.py.
-        Wraps build() to match the original call signature.
-
-        Returns:
-            (points, steering, speeds, segment_lengths)
-        """
-        points, steering, speeds = self.build(list(pillars), d0, df)
-        # Compute cumulative segment lengths
-        diffs = np.diff(points, axis=0)
-        seg_len = np.hypot(diffs[:, 0], diffs[:, 1])
-        return points, steering, speeds, seg_len
+        return (np.round(points, 2),
+                np.round(steering, 2),
+                np.round(speed, 2),
+                seg_lengths)
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _offset_point(self, pillar) -> np.ndarray:
+    def _sample_segment(self, P0: np.ndarray, P3: np.ndarray,
+                         v0: np.ndarray, v3: np.ndarray) -> tuple:
         """
-        Return a via-point offset from the pillar in the correct direction.
+        Sample a cubic Bézier segment by arc length.
 
-        Red  → pass to the RIGHT → offset in +x direction (robot frame).
-        Green→ pass to the LEFT  → offset in -x direction (robot frame).
+        Returns (points, steering_angles, safe_speeds).
         """
-        offset = self.PILLAR_OFFSET_CM
-        if pillar.color == "red":
-            return np.array([pillar.x_cm + offset, pillar.y_cm])
-        else:  # green
-            return np.array([pillar.x_cm - offset, pillar.y_cm])
+        v0 = v0 / (np.linalg.norm(v0) + 1e-9)
+        v3 = v3 / (np.linalg.norm(v3) + 1e-9)
+        d  = np.linalg.norm(P3 - P0) / 3
+        P1 = P0 + d * v0
+        P2 = P3 - d * v3
 
-    def _bezier_curve(
-        self,
-        via: np.ndarray,
-        d0: np.ndarray,
-        df: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Fit a cubic Bézier curve: start at via[0], end at via[-1],
-        with tangents d0 and df.  Intermediate via-points are used to
-        position control points P1 and P2.
-        """
-        p0 = via[0]
-        p3 = via[-1]
+        def bezier(t):
+            return ((1-t)**3*P0 + 3*(1-t)**2*t*P1 +
+                    3*(1-t)*t**2*P2 + t**3*P3)
 
-        # Scale tangent handles by 1/3 of total arc length estimate
-        chord = np.linalg.norm(p3 - p0)
-        handle = chord / 3.0
+        # Dense sample for arc-length parameterisation
+        t_dense = np.linspace(0, 1, 1000)
+        curve   = np.array([bezier(t) for t in t_dense])
+        dists   = np.sqrt(np.sum(np.diff(curve, axis=0)**2, axis=1))
+        cumlen  = np.insert(np.cumsum(dists), 0, 0)
+        total   = cumlen[-1]
 
-        p1 = p0 + handle * d0 / (np.linalg.norm(d0) + 1e-9)
-        p2 = p3 - handle * df / (np.linalg.norm(df) + 1e-9)
+        n_pts   = max(int(total / self.resolution_cm), 2)
+        t_samp  = np.interp(np.linspace(0, total, n_pts), cumlen, t_dense)
+        points  = np.array([bezier(t) for t in t_samp])
 
-        t = np.linspace(0, 1, self.N)[:, None]  # (N,1) for broadcasting
-        points = (
-            (1 - t) ** 3 * p0
-            + 3 * (1 - t) ** 2 * t * p1
-            + 3 * (1 - t) * t ** 2 * p2
-            + t ** 3 * p3
+        # Curvature → steering angle
+        dx  = np.gradient(points[:, 0], t_samp)
+        dy  = np.gradient(points[:, 1], t_samp)
+        d2x = np.gradient(dx, t_samp)
+        d2y = np.gradient(dy, t_samp)
+
+        curv  = np.abs(dx*d2y - dy*d2x) / (dx**2 + dy**2)**1.5
+        R     = 1.0 / (curv + 1e-9)
+        sign  = np.sign(dx*d2y - dy*d2x)
+        L     = 13   # wheelbase in cm
+        steer = -sign * np.degrees(np.arctan(L / R))
+
+        # Speed profile: slower when steering sharply
+        a_y_max   = 2.0    # m/s²
+        max_speed = 3.0    # m/s
+        safe_spd  = np.minimum(
+            np.sqrt(a_y_max * (L/100) /
+                    (np.tan(np.radians(np.abs(steer))) + 1e-9)),
+            max_speed
         )
-        return points  # (N, 2)
+        safe_spd = np.clip(safe_spd, 0.5, max_speed)
 
-    def _straight_trajectory(self, direction: np.ndarray) -> tuple:
-        """Fallback: straight line of 150 cm in the given direction."""
-        d = direction / (np.linalg.norm(direction) + 1e-9)
-        t = np.linspace(0, 150, self.N)[:, None]
-        points = t * d
-        steering = np.zeros(self.N)
-        speeds   = np.full(self.N, TrajParams.DEFAULT_SPEED, dtype=float)
-        return points, steering, speeds
+        return points, steer, safe_spd
 
-    def _steering_from_tangents(self, points: np.ndarray) -> np.ndarray:
-        """
-        Compute steering angle (degrees) from the curvature of the path.
-        Uses the Ackermann formula: steer = arctan(L / R)
-        where R is the local radius of curvature.
-        """
-        L = RobotParams.WHEELBASE_CM
-        n = len(points)
-        steering = np.zeros(n)
 
-        for i in range(1, n - 1):
-            p_prev, p_curr, p_next = points[i - 1], points[i], points[i + 1]
-            # Menger curvature
-            a = np.linalg.norm(p_curr - p_prev)
-            b = np.linalg.norm(p_next - p_curr)
-            c = np.linalg.norm(p_next - p_prev)
-            area2 = abs(np.cross(p_curr - p_prev, p_next - p_prev))
-            if area2 < 1e-6 or a * b * c < 1e-6:
-                continue
-            R = (a * b * c) / area2
-            # Sign: cross product of consecutive tangents
-            t1 = p_curr - p_prev
-            t2 = p_next - p_curr
-            sign = 1.0 if np.cross(t1, t2) > 0 else -1.0
-            steering[i] = sign * np.degrees(np.arctan2(L, R))
+# ── Standalone test ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
 
-        # Propagate to endpoints
-        steering[0]  = steering[1]
-        steering[-1] = steering[-2]
-        return steering
+    class _Pillar:
+        def __init__(self, x, y, color, sec):
+            self.x_cm = x; self.y_cm = y
+            self.color = color; self.section_nb = sec
 
-    def _speed_profile(self, steering: np.ndarray) -> np.ndarray:
-        """Reduce speed proportionally to steering angle magnitude."""
-        max_steer = 30.0
-        base  = TrajParams.DEFAULT_SPEED
-        slow  = TrajParams.CORNER_SPEED
-        ratio = np.clip(np.abs(steering) / max_steer, 0, 1)
-        return base - ratio * (base - slow)
+    pillars = np.array([
+        _Pillar(60, 100, "red",   1),
+        _Pillar(40, 200, "green", 1),
+        _Pillar(100, 260, "red",  2),
+        _Pillar(260, 150, "green",3),
+        _Pillar(100,  40, "red",  4),
+    ])
+
+    tb = TrajectoryBuilder(3.0)
+    pts, steer, spd, _ = tb.bezier_curve_from_pillars(
+        pillars, np.array([50, 50]), np.array([1, 0]), np.array([0, -1]), 0)
+
+    plt.figure(); plt.plot(pts[:,0], pts[:,1]); plt.axis("equal")
+    plt.title("Trajectory"); plt.show()
